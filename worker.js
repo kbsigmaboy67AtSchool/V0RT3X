@@ -1,6 +1,6 @@
 /**
  * V0RT3X Cloudflare Workers + Durable Objects relay
- * Path = room. Special: /r/__public_directory stores public room announcements.
+ * Path = room. /r/__public_directory = public list with TTL + unpublish.
  */
 export class Room {
   constructor(state, env) {
@@ -19,8 +19,11 @@ export class Room {
     return (await this.state.storage.get("publicRooms")) || [];
   }
   async saveRooms(rooms) {
-    // keep last 100
     await this.state.storage.put("publicRooms", rooms.slice(-100));
+  }
+  prune(rooms) {
+    const now = Date.now();
+    return rooms.filter((r) => r && r.url && (!r.expires || r.expires > now));
   }
 
   async fetch(request) {
@@ -40,61 +43,92 @@ export class Room {
     server.accept();
 
     const sid = crypto.randomUUID().slice(0, 8);
-    this.sessions.set(server, { id: sid, ipId });
+    this.sessions.set(server, { id: sid, ipId, publishedUrls: new Set() });
 
     server.send(JSON.stringify({ t: "hello", ipId, sid }));
 
     if (this.isDirectory) {
-      const rooms = await this.loadRooms();
+      let rooms = this.prune(await this.loadRooms());
+      await this.saveRooms(rooms);
       server.send(JSON.stringify({ t: "public-list", rooms }));
     }
 
+    const broadcastDir = async (msgObj) => {
+      const msg = JSON.stringify(msgObj);
+      for (const [ws] of this.sessions) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try { ws.send(msg); } catch (_) {}
+        }
+      }
+    };
+
     server.addEventListener("message", async (event) => {
-      let data = event.data;
       let parsed = null;
       try {
-        parsed = JSON.parse(typeof data === "string" ? data : "");
+        parsed = JSON.parse(typeof event.data === "string" ? event.data : "");
       } catch (_) {}
 
       if (this.isDirectory && parsed) {
         if (parsed.t === "public-sync") {
-          const rooms = await this.loadRooms();
+          let rooms = this.prune(await this.loadRooms());
+          await this.saveRooms(rooms);
           try {
             server.send(JSON.stringify({ t: "public-list", rooms }));
           } catch (_) {}
           return;
         }
-        if (parsed.t === "public-announce" && parsed.room) {
-          let rooms = await this.loadRooms();
-          const idx = rooms.findIndex((r) => r.url === parsed.room.url);
-          if (idx >= 0) rooms[idx] = parsed.room;
-          else rooms.push(parsed.room);
+        if (parsed.t === "public-announce" && parsed.room && parsed.room.url) {
+          const room = {
+            ...parsed.room,
+            owner: parsed.room.owner || sid,
+            expires: parsed.room.expires || Date.now() + 10 * 60 * 1000,
+            ts: Date.now(),
+          };
+          let rooms = this.prune(await this.loadRooms());
+          const idx = rooms.findIndex((r) => r.url === room.url);
+          if (idx >= 0) rooms[idx] = room;
+          else rooms.push(room);
           await this.saveRooms(rooms);
-          // broadcast announce
-          const msg = JSON.stringify({ t: "public-announce", room: parsed.room });
-          for (const [ws] of this.sessions) {
-            if (ws.readyState === WebSocket.OPEN) {
-              try {
-                ws.send(msg);
-              } catch (_) {}
-            }
-          }
+          const sess = this.sessions.get(server);
+          if (sess) sess.publishedUrls.add(room.url);
+          await broadcastDir({ t: "public-announce", room });
           return;
         }
+        if (parsed.t === "public-unpublish" && parsed.url) {
+          let rooms = this.prune(await this.loadRooms());
+          rooms = rooms.filter((r) => r.url !== parsed.url);
+          await this.saveRooms(rooms);
+          const sess = this.sessions.get(server);
+          if (sess) sess.publishedUrls.delete(parsed.url);
+          await broadcastDir({ t: "public-unpublish", url: parsed.url });
+          return;
+        }
+        return; // don't fall through on directory
       }
 
-      // Normal room: broadcast to others
+      // Normal room broadcast
       for (const [ws] of this.sessions) {
         if (ws !== server && ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(event.data);
-          } catch (_) {}
+          try { ws.send(event.data); } catch (_) {}
         }
       }
     });
 
-    server.addEventListener("close", () => this.sessions.delete(server));
-    server.addEventListener("error", () => this.sessions.delete(server));
+    const cleanup = async () => {
+      const sess = this.sessions.get(server);
+      this.sessions.delete(server);
+      if (this.isDirectory && sess && sess.publishedUrls.size) {
+        let rooms = this.prune(await this.loadRooms());
+        const gone = [...sess.publishedUrls];
+        rooms = rooms.filter((r) => !gone.includes(r.url));
+        await this.saveRooms(rooms);
+        for (const u of gone) {
+          await broadcastDir({ t: "public-unpublish", url: u });
+        }
+      }
+    };
+    server.addEventListener("close", () => { cleanup(); });
+    server.addEventListener("error", () => { cleanup(); });
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -104,7 +138,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response("V0RT3X relay — path = room · /r/__public_directory = public list\n", {
+      return new Response("V0RT3X relay — /r/__public_directory = public list (TTL + auto-unpublish)\n", {
         headers: { "content-type": "text/plain" },
       });
     }
