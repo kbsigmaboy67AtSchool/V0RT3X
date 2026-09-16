@@ -1,60 +1,70 @@
-export class Room {
-  constructor(state, env) {
-    this.state = state;
-    this.sessions = new Map(); // ws -> { id, ipId }
-  }
 
-  async hashIp(ip) {
-    const data = new TextEncoder().encode("v0rt3x|" + ip);
-    const buf = await crypto.subtle.digest("SHA-256", data);
-    const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-    return hex.slice(0, 10); // short stable id
-  }
+#!/usr/bin/env node
+/**
+ * V0RT3X simple path-based broadcast relay (Node.js)
+ * --------------------------------------------------
+ * Each unique path is its own room.
+ *
+ *   ws://localhost:8787/r/lobby
+ *   ws://localhost:8787/r/secret
+ *
+ * Usage:
+ *   npm install ws
+ *   node simple-relay.js [port]
+ *
+ * Default port: 8787
+ */
 
-  async fetch(request) {
-    const upgrade = request.headers.get("Upgrade");
-    if (upgrade !== "websocket") {
-      return new Response("V0RT3X room — expect WebSocket", { status: 426 });
-    }
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const { URL } = require("url");
 
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-    const ipId = await this.hashIp(ip);
+const port = parseInt(process.argv[2] || "8787", 10);
 
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    server.accept();
+// Map<path, Set<WebSocket>>
+const rooms = new Map();
 
-    const sid = crypto.randomUUID().slice(0, 8);
-    this.sessions.set(server, { id: sid, ipId });
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("V0RT3X simple relay — path = room\n");
+});
 
-    // Tell this client their IP hash (never the raw IP)
-    server.send(JSON.stringify({ t: "hello", ipId, sid }));
+const wss = new WebSocketServer({ noServer: true });
 
-    server.addEventListener("message", (event) => {
-      for (const [ws] of this.sessions) {
-        if (ws !== server && ws.readyState === WebSocket.OPEN) {
-          try { ws.send(event.data); } catch (_) {}
+server.on("upgrade", (request, socket, head) => {
+  const url = new URL(request.url || "/", `http://${request.headers.host}`);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    if (!rooms.has(path)) rooms.set(path, new Set());
+    const room = rooms.get(path);
+    room.add(ws);
+
+    console.log(`[+] ${path}  (clients: ${room.size})`);
+
+    ws.on("message", (data, isBinary) => {
+      for (const client of room) {
+        if (client !== ws && client.readyState === 1) {
+          client.send(data, { binary: isBinary });
         }
       }
     });
 
-    server.addEventListener("close", () => this.sessions.delete(server));
-    server.addEventListener("error", () => this.sessions.delete(server));
+    ws.on("close", () => {
+      room.delete(ws);
+      console.log(`[-] ${path}  (clients: ${room.size})`);
+      if (room.size === 0) rooms.delete(path);
+    });
 
-    return new Response(null, { status: 101, webSocket: client });
-  }
-}
+    ws.on("error", () => {
+      room.delete(ws);
+    });
+  });
+});
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response("V0RT3X relay — path = room\n", {
-        headers: { "content-type": "text/plain" },
-      });
-    }
-    const roomId = url.pathname.replace(/^\/+/, "") || "default";
-    const id = env.ROOMS.idFromName(roomId);
-    return env.ROOMS.get(id).fetch(request);
-  },
-};
+server.listen(port, () => {
+  console.log(`V0RT3X relay on ws://0.0.0.0:${port}`);
+  console.log(`Example rooms:`);
+  console.log(`  ws://localhost:${port}/r/lobby`);
+  console.log(`  ws://localhost:${port}/r/my-secret-room`);
+});
